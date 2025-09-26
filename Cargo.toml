@@ -1,0 +1,16 @@
+[package]
+name = "marstui-sink"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+tui = "0.19"
+crossterm = "0.26"
+regex = "1.7"
+#serde = "1.0.216"
+libpulse-binding = "2.26.0"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "6.0.0"
+toml = "0.9.6"
+zbus = "5.6.0"
+chrono = { version = "=0.4.26", features = ["serde"] }
