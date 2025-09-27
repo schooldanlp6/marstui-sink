@@ -1,5 +1,7 @@
 # Marstui-Sink
 
+the sink module for marstui
+
 A sink management tool for marstui
 
 most importantly it needs this dependencie to build:
