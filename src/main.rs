@@ -1,13 +1,13 @@
 use std::{
     fs,
     io,
-    path::PathBuf,
     process::Command,
     time::Duration,
+    path::PathBuf,
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,332 +17,273 @@ use tui::{
     style::{Color, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem, Tabs},
-    Terminal,
+    Terminal, Frame,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use dirs;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Debug, Deserialize)]
 struct Config {
-    backend: String, // "pw" for PipeWire, "pl" for Pulse
+    #[serde(default = "default_backend")]
+    backend: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self { backend: "pw".to_string() }
-    }
+fn default_backend() -> String {
+    "pw".to_string()
 }
 
-fn load_config() -> Config {
-    let config_path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("marstui/sink.toml");
-
-    if !config_path.exists() {
-        let default = Config::default();
-        let toml_str = toml::to_string(&default).unwrap();
-        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        fs::write(&config_path, toml_str).unwrap();
-        default
-    } else {
-        let content = fs::read_to_string(&config_path).unwrap();
-        toml::from_str(&content).unwrap_or_else(|_| Config::default())
-    }
-}
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Sink {
     name: String,
-    module_id: Option<u32>,
     streams: Vec<Stream>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Stream {
-    id: u32,
+    id: String,
     name: String,
 }
 
-enum Mode {
-    Normal,
-    Modify(usize),
+fn load_config() -> Config {
+    let mut path = dirs::config_dir().unwrap_or(PathBuf::from("."));
+    path.push("marstui/sink.toml");
+    let content = fs::read_to_string(path).expect("Could not read sink.toml");
+    toml::from_str(&content).expect("Could not parse sink.toml")
 }
 
-enum ActiveList {
-    Attached,
-    Available,
-}
+fn fetch_sinks(config: &Config) -> Vec<Sink> {
+    if config.backend == "pw" {
+        let output = Command::new("pw-cli")
+            .arg("list-objects")
+            .output()
+            .expect("failed to run pw-cli");
 
-fn run_pactl(args: &[&str]) -> String {
-    String::from_utf8(
-        Command::new("pactl").args(args).output().unwrap().stdout,
-    )
-    .unwrap()
-}
-
-fn fetch_sinks() -> Vec<Sink> {
-    let output = run_pactl(&["list", "short", "sinks"]);
-    let mut sinks = Vec::new();
-
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let name = parts[1].to_string();
-            sinks.push(Sink {
-                name,
-                module_id: None, // we’ll fill for null sinks
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .filter(|l| l.contains("PipeWire:Interface:Node") && l.contains("Audio/Sink"))
+            .map(|l| Sink {
+                name: l.trim().to_string(),
                 streams: vec![],
-            });
-        }
-    }
+            })
+            .collect()
+    } else {
+        let output = Command::new("pactl")
+            .arg("list")
+            .arg("sinks")
+            .output()
+            .expect("failed to run pactl");
 
-    // attach streams
-    let sinputs = run_pactl(&["list", "sink-inputs"]);
-    let mut current_id = None;
-    let mut current_name = String::new();
-    let mut current_sink = String::new();
-
-    for line in sinputs.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Sink Input #") {
-            if let Some(id) = current_id {
-                if let Some(sink) = sinks.iter_mut().find(|s| s.name == current_sink) {
-                    sink.streams.push(Stream { id, name: current_name.clone() });
-                }
-            }
-            current_id = trimmed.split('#').nth(1).and_then(|n| n.trim().parse::<u32>().ok());
-            current_name.clear();
-            current_sink.clear();
-        } else if trimmed.starts_with("Sink:") {
-            current_sink = trimmed.split_whitespace().nth(1).unwrap_or("").to_string();
-        } else if trimmed.starts_with("application.name =") {
-            current_name = trimmed.splitn(2, '=').nth(1).unwrap_or("").trim_matches('"').to_string();
-        }
-    }
-    if let Some(id) = current_id {
-        if let Some(sink) = sinks.iter_mut().find(|s| s.name == current_sink) {
-            sink.streams.push(Stream { id, name: current_name.clone() });
-        }
-    }
-
-    sinks
-}
-
-fn fetch_available_streams(sinks: &[Sink]) -> Vec<Stream> {
-    let mut all = Vec::new();
-    let sinputs = run_pactl(&["list", "sink-inputs"]);
-
-    let mut current_id = None;
-    let mut current_name = String::new();
-    let mut current_sink = String::new();
-
-    for line in sinputs.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Sink Input #") {
-            if let Some(id) = current_id {
-                let attached = sinks.iter().any(|s| s.streams.iter().any(|st| st.id == id));
-                if !attached {
-                    all.push(Stream { id, name: current_name.clone() });
-                }
-            }
-            current_id = trimmed.split('#').nth(1).and_then(|n| n.trim().parse::<u32>().ok());
-            current_name.clear();
-            current_sink.clear();
-        } else if trimmed.starts_with("application.name =") {
-            current_name = trimmed.splitn(2, '=').nth(1).unwrap_or("").trim_matches('"').to_string();
-        } else if trimmed.starts_with("Sink:") {
-            current_sink = trimmed.split_whitespace().nth(1).unwrap_or("").to_string();
-        }
-    }
-    if let Some(id) = current_id {
-        let attached = sinks.iter().any(|s| s.streams.iter().any(|st| st.id == id));
-        if !attached {
-            all.push(Stream { id, name: current_name.clone() });
-        }
-    }
-
-    all
-}
-
-fn create_sink() {
-    let name = format!("marstui-null-{}", chrono::Utc::now().timestamp());
-    let _ = Command::new("pactl")
-        .args(&["load-module", "module-null-sink", &format!("sink_name={}", name)])
-        .output();
-}
-
-fn delete_sink(name: &str) {
-    // find its module
-    let modules = run_pactl(&["list", "short", "modules"]);
-    for line in modules.lines() {
-        if line.contains(name) {
-            if let Some(id) = line.split_whitespace().next() {
-                let _ = Command::new("pactl").args(&["unload-module", id]).output();
-            }
-        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .split("Sink #")
+            .skip(1)
+            .map(|s| {
+                let name_line = s
+                    .lines()
+                    .find(|l| l.trim().starts_with("Name:"))
+                    .unwrap_or("Name: unknown");
+                let name = name_line.split_whitespace().nth(1).unwrap_or("unknown").to_string();
+                Sink { name, streams: vec![] }
+            })
+            .collect()
     }
 }
 
-fn attach_stream(stream: &Stream, sink: &Sink) {
-    let _ = Command::new("pactl")
-        .args(&["move-sink-input", &stream.id.to_string(), &sink.name])
-        .output();
+fn fetch_streams(config: &Config, sink: &Sink) -> Vec<Stream> {
+    if config.backend == "pw" {
+        let output = Command::new("pw-cli")
+            .arg("list-objects")
+            .output()
+            .expect("failed to run pw-cli");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .filter(|l| l.contains("PipeWire:Interface:Node") && l.contains("Audio/Stream"))
+            .map(|l| Stream {
+                id: l.to_string(),
+                name: l.to_string(),
+            })
+            .collect()
+    } else {
+        let output = Command::new("pactl")
+            .arg("list")
+            .arg("sink-inputs")
+            .output()
+            .expect("failed to run pactl");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .split("Sink Input #")
+            .skip(1)
+            .map(|s| {
+                let id = s.lines().next().unwrap_or("0").trim().to_string();
+                let name_line = s
+                    .lines()
+                    .find(|l| l.trim().starts_with("application.name ="))
+                    .unwrap_or("application.name = \"unknown\"");
+                let name = name_line
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or("\"unknown\"")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                Stream { id, name }
+            })
+            .collect()
+    }
 }
 
-fn detach_stream(stream: &Stream) {
-    // move to default sink
-    let def = run_pactl(&["info"]);
-    let default_sink = def.lines().find(|l| l.contains("Default Sink")).unwrap_or("Default Sink: @DEFAULT_SINK@");
-    let sink = default_sink.split(':').nth(1).unwrap().trim();
-    let _ = Command::new("pactl")
-        .args(&["move-sink-input", &stream.id.to_string(), sink])
-        .output();
+fn attach_stream(config: &Config, stream: &Stream, sink: &Sink) {
+    if config.backend == "pw" {
+        let _ = Command::new("pw-link")
+            .arg(&stream.id)
+            .arg(&sink.name)
+            .status();
+    } else {
+        let _ = Command::new("pactl")
+            .arg("move-sink-input")
+            .arg(&stream.id)
+            .arg(&sink.name)
+            .status();
+    }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _config = load_config();
+fn detach_stream(config: &Config, stream: &Stream, sink: &Sink) {
+    if config.backend == "pw" {
+        let _ = Command::new("pw-link")
+            .arg("-d")
+            .arg(&stream.id)
+            .arg(&sink.name)
+            .status();
+    } else {
+        let _ = Command::new("pactl")
+            .arg("suspend-sink-input")
+            .arg(&stream.id)
+            .arg("1")
+            .status();
+    }
+}
+
+/// Draws the full UI
+fn draw_ui(f: &mut Frame<CrosstermBackend<io::Stdout>>, config: &Config, sinks: &Vec<Sink>, selected_sink: usize, selected_action: usize, actions: &Vec<&str>) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(f.size());
+
+    // Top bar
+    let top = Block::default()
+        .title(format!(
+            " Backend: {} | Selected sink: {} ",
+            config.backend,
+            sinks.get(selected_sink).map(|s| &s.name).unwrap_or(&"-".to_string())
+        ))
+        .borders(Borders::ALL);
+    f.render_widget(top, chunks[0]);
+
+    // Sink list
+    let items: Vec<ListItem> = sinks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let style = if i == selected_sink {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Spans::from(Span::styled(&s.name, style)))
+        })
+        .collect();
+    let sink_list = List::new(items).block(Block::default().borders(Borders::ALL).title("Sinks"));
+    f.render_widget(sink_list, chunks[1]);
+
+    // Bottom bar
+    let spans: Vec<Spans> = actions
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let style = if i == selected_action {
+                Style::default().fg(Color::Yellow).bg(Color::Blue)
+            } else {
+                Style::default()
+            };
+            Spans::from(Span::styled(*t, style))
+        })
+        .collect();
+    let tabs = Tabs::new(spans)
+        .block(Block::default().borders(Borders::ALL).title("Actions"));
+    f.render_widget(tabs, chunks[2]);
+}
+
+fn main() -> Result<(), io::Error> {
+    let config = load_config();
+    let mut sinks = fetch_sinks(&config);
+    let mut selected_sink = 0usize;
+    let mut selected_action = 0usize;
+    let mut selected_stream = 0usize;
+    let actions = vec!["Create", "Delete", "Modify"];
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut sink = Terminal::new(backend)?;
 
-    let mut sinks = fetch_sinks();
-    let mut mode = Mode::Normal;
-    let mut selected_sink = 0usize;
-    let mut selected_action = 0usize;
-    let mut active_list = ActiveList::Attached;
-    let mut selected_attached = 0usize;
-    let mut selected_available = 0usize;
-
     loop {
-        let available_streams = fetch_available_streams(&sinks);
-
         sink.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(3)].as_ref())
-                .split(f.size());
-
-            let top = Block::default().borders(Borders::ALL).title("Selected Sink");
-            let title = sinks.get(selected_sink).map(|s| s.name.clone()).unwrap_or_default();
-            let paragraph = tui::widgets::Paragraph::new(title).block(top);
-            f.render_widget(paragraph, chunks[0]);
-
-            // Middle
-            match mode {
-                Mode::Normal => {
-                    let items: Vec<ListItem> = sinks.iter().enumerate().map(|(i, s)| {
-                        let style = if i == selected_sink { Style::default().fg(Color::Yellow) } else { Style::default() };
-                        ListItem::new(Spans::from(Span::styled(s.name.clone(), style)))
-                    }).collect();
-                    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Sinks"));
-                    f.render_widget(list, chunks[1]);
-                }
-                Mode::Modify(idx) => {
-                    if let Some(s) = sinks.get(idx) {
-                        let inner = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                            .split(chunks[1]);
-
-                        let attached: Vec<ListItem> = s.streams.iter().enumerate().map(|(i, st)| {
-                            let style = if matches!(active_list, ActiveList::Attached) && i == selected_attached {
-                                Style::default().fg(Color::Black).bg(Color::Yellow)
-                            } else { Style::default() };
-                            ListItem::new(Spans::from(Span::styled(st.name.clone(), style)))
-                        }).collect();
-                        let available: Vec<ListItem> = available_streams.iter().enumerate().map(|(i, st)| {
-                            let style = if matches!(active_list, ActiveList::Available) && i == selected_available {
-                                Style::default().fg(Color::Black).bg(Color::Yellow)
-                            } else { Style::default() };
-                            ListItem::new(Spans::from(Span::styled(st.name.clone(), style)))
-                        }).collect();
-
-                        f.render_widget(List::new(attached).block(Block::default().borders(Borders::ALL).title("Attached")), inner[0]);
-                        f.render_widget(List::new(available).block(Block::default().borders(Borders::ALL).title("Available")), inner[1]);
-                    }
-                }
-            }
-
-            // Bottom
-            let bottom_titles = vec!["Create", "Delete", "Modify"];
-            let spans: Vec<Spans> = bottom_titles.iter().enumerate().map(|(i, t)| {
-                let style = if i == selected_action {
-                    Style::default().fg(Color::Yellow).bg(Color::Blue)
-                } else { Style::default() };
-                Spans::from(Span::styled(*t, style))
-            }).collect();
-            let tabs = Tabs::new(spans).block(Block::default().borders(Borders::ALL).title("Actions"));
-            f.render_widget(tabs, chunks[2]);
+            draw_ui(f, &config, &sinks, selected_sink, selected_action, &actions);
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                match mode {
-                    Mode::Normal => match k.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Up => if selected_sink > 0 { selected_sink -= 1; },
-                        KeyCode::Down => if selected_sink + 1 < sinks.len() { selected_sink += 1; },
-                        KeyCode::Left => if selected_action > 0 { selected_action -= 1; },
-                        KeyCode::Right => if selected_action < 2 { selected_action += 1; },
-                        KeyCode::Enter => {
-                            match selected_action {
-                                0 => create_sink(),
-                                1 => {
-                                    if let Some(s) = sinks.get(selected_sink) {
-                                        delete_sink(&s.name);
-                                    }
-                                }
-                                2 => mode = Mode::Modify(selected_sink),
-                                _ => {}
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Left => if selected_action > 0 { selected_action -= 1; },
+                    KeyCode::Right => if selected_action < actions.len() - 1 { selected_action += 1; },
+                    KeyCode::Up => if selected_sink > 0 { selected_sink -= 1; },
+                    KeyCode::Down => if selected_sink < sinks.len().saturating_sub(1) { selected_sink += 1; },
+                    KeyCode::Char('r') => { sinks = fetch_sinks(&config); }
+                    KeyCode::Char('m') => {
+                        if selected_action == 2 {
+                            if let Some(sink) = sinks.get_mut(selected_sink) {
+                                sink.streams = fetch_streams(&config, sink);
                             }
                         }
-                        _ => {}
-                    },
-                    Mode::Modify(idx) => match k.code {
-                        KeyCode::Char('q') => mode = Mode::Normal,
-                        KeyCode::Tab => {
-                            active_list = match active_list {
-                                ActiveList::Attached => ActiveList::Available,
-                                ActiveList::Available => ActiveList::Attached,
-                            };
-                        }
-                        KeyCode::Up => match active_list {
-                            ActiveList::Attached => if selected_attached > 0 { selected_attached -= 1; },
-                            ActiveList::Available => if selected_available > 0 { selected_available -= 1; },
-                        },
-                        KeyCode::Down => match active_list {
-                            ActiveList::Attached => selected_attached += 1,
-                            ActiveList::Available => selected_available += 1,
-                        },
-                        KeyCode::Enter => {
-                            if let Some(sink) = sinks.get(idx) {
-                                match active_list {
-                                    ActiveList::Attached => {
-                                        if let Some(stream) = sink.streams.get(selected_attached) {
-                                            detach_stream(stream);
-                                        }
-                                    }
-                                    ActiveList::Available => {
-                                        if let Some(stream) = available_streams.get(selected_available) {
-                                            attach_stream(stream, sink);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                    KeyCode::Char('a') => {
+                        if selected_action == 2 {
+                            if let Some(sink) = sinks.get(selected_sink) {
+                                if let Some(stream) = sink.streams.get(selected_stream) {
+                                    attach_stream(&config, stream, sink);
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if selected_action == 2 {
+                            if let Some(sink) = sinks.get(selected_sink) {
+                                if let Some(stream) = sink.streams.get(selected_stream) {
+                                    detach_stream(&config, stream, sink);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                sinks = fetch_sinks();
             }
         }
     }
 
     disable_raw_mode()?;
-    execute!(sink.backend_mut(), LeaveAlternateScreen)?;
+    execute!(sink.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     sink.show_cursor()?;
     Ok(())
 }
