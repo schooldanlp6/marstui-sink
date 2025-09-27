@@ -259,6 +259,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let available_streams = fetch_available_streams(&sinks, &config);
+        sinks = fetch_sinks(&config);
+        let attached_streams = &sinks[selected_sink].streams;
+        let available_streams = fetch_available_streams(&sinks, &config);
+        
+        // Compute once for this loop iteration
+        let all_streams: Vec<(Stream, bool)> = attached_streams
+            .iter()
+            .map(|s| (s.clone(), true))
+            .chain(available_streams.into_iter().map(|s| {
+                let attached = attached_streams.iter().any(|a| a.id == s.id);
+                (s, attached)
+            }))
+            .collect();
 
         sink.draw(|f| {
             let chunks = Layout::default()
@@ -288,27 +301,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
                         .split(chunks[1]);
 
+                    // Fetch latest streams each iteration
+                    let attached_streams = &sinks[selected_sink].streams;
+                    let available_streams = fetch_available_streams(&sinks, &config);
+
+                    // Combine attached and available streams into one vector with attached marker
+                    let all_streams: Vec<(Stream, bool)> = attached_streams
+                        .iter()
+                        .map(|s| (s.clone(), true))
+                        .chain(
+                            available_streams.into_iter().map(|s| {
+                                let attached = attached_streams.iter().any(|a| a.id == s.id);
+                                (s, attached)
+                            })
+                        )
+                        .collect();
+                    
                     // Left = Streams
-                    let stream_items: Vec<ListItem> = available_streams.iter().enumerate().map(|(i, s)| {
-                        // check if attached to selected sink
-                        let attached = sinks[selected_sink].streams.iter().any(|st| st.id == s.id);
-                        let dot = if attached { "●" } else { "○" };
-                    
-                        // right-align the dot by padding stream name
-                        let label = format!("{:<50} {}", s.name, dot);
-                    
+                    let stream_items: Vec<ListItem> = all_streams.iter().enumerate().map(|(i, (s, attached))| {
+                        let label = format!("{:<50} {}", s.name, if *attached { "●" } else { "○" });
                         let style = if matches!(focus, Focus::Streams) && i == selected_stream {
                             Style::default().fg(Color::Black).bg(Color::Yellow)
                         } else { Style::default() };
-                    
                         ListItem::new(Spans::from(Span::styled(label, style)))
                     }).collect();
-                    f.render_widget(
-                        List::new(stream_items)
-                            .block(Block::default().borders(Borders::ALL).title("Streams")),
-                        inner[0]
-                    );
-
+                
                     // Right = Sinks
                     let sink_items: Vec<ListItem> = sinks.iter().enumerate().map(|(i, s)| {
                         let style = if matches!(focus, Focus::Sinks) && i == selected_sink {
@@ -316,7 +333,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else { Style::default() };
                         ListItem::new(Spans::from(Span::styled(s.name.clone(), style)))
                     }).collect();
-                    f.render_widget(List::new(sink_items).block(Block::default().borders(Borders::ALL).title("Sinks")), inner[1]);
+                
+                    f.render_widget(
+                        List::new(stream_items)
+                            .block(Block::default().borders(Borders::ALL).title("Streams")),
+                        inner[0]
+                    );
+                
+                    f.render_widget(
+                        List::new(sink_items)
+                            .block(Block::default().borders(Borders::ALL).title("Sinks")),
+                        inner[1]
+                    );
                 }
             }
 
@@ -356,21 +384,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Up => match focus {
                             Focus::Streams => if selected_stream > 0 { selected_stream -= 1 },
                             Focus::Sinks => if selected_sink > 0 { selected_sink -= 1 },
-                        },
-                        KeyCode::Down => match focus {
+                        },KeyCode::Down => match focus {
                             Focus::Streams => selected_stream = selected_stream.saturating_add(1),
                             Focus::Sinks => selected_sink = selected_sink.saturating_add(1),
-                        },
-                        KeyCode::Enter => {
-                            if let Some(stream) = fetch_available_streams(&sinks, &config).get(selected_stream) {
-                                if let Some(s) = sinks.get(selected_sink) {
-                                    attach_sink(&config, stream, s);
+                        },KeyCode::Enter | KeyCode::Char('a') => {
+                            if let Some((stream, attached)) = all_streams.get(selected_stream) {
+                                if let Some(sink) = sinks.get(selected_sink) {
+                                    // Only attach if not already attached
+                                    if !*attached {
+                                        attach_sink(&config, stream, sink);
+                                    }
                                 }
                             }
-                        },
-                        KeyCode::Char('d') => {
-                            if let Some(stream) = fetch_available_streams(&sinks, &config).get(selected_stream) {
-                                detach_sink(&config, stream);
+                        },KeyCode::Char('d') => {
+                            if let Some((stream, attached)) = all_streams.get(selected_stream) {
+                                // Only detach if attached
+                                if *attached {
+                                    detach_sink(&config, stream);
+                                }
                             }
                         },
                         _ => {}
