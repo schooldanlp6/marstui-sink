@@ -371,7 +371,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Right => if selected_action < 2 { selected_action += 1 },
                         KeyCode::Enter => match selected_action {
                             0 => create_sink(),
-                            1 => if let Some(s) = sinks.get(selected_sink) { delete_sink(&s.name) },
+                            1 => if let Some(s) = sinks.get(selected_sink) {
+                                delete_sink(&s.name);
+
+                                if selected_sink > 0 {
+                                    selected_sink -= 1;
+                                } else if sinks.len() > 1 {
+                                    selected_sink = sinks.len() - 1;
+                                }
+                            },
                             2 => mode = Mode::Modify(selected_sink),
                             _ => {}
                         },
